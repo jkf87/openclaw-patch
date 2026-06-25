@@ -1,0 +1,17 @@
+{
+  "name": "openclaw-patch",
+  "version": "1.0.0",
+  "description": "Pre-setup patches for OpenClaw Windows node (port conflict + WSL TLS certs)",
+  "bin": {
+    "openclaw-patch": "./bin/openclaw-patch.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["openclaw", "wsl", "patch"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jkf87/openclaw-patch.git"
+  }
+}
