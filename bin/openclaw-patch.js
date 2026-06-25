@@ -6,10 +6,56 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+// ─── Config Detection ───
+
+function detectConfig() {
+  const cfg = { port: 18789, distro: "OpenClawGateway" };
+
+  // 1. (lowest) Read from setup config if present
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const configLocations = [
+    path.join(appData, "OpenClawTray", "setup-config.json"),
+    path.join(localAppData, "OpenClawTray", "setup-config.json"),
+  ];
+  for (const cfgPath of configLocations) {
+    try {
+      if (fs.existsSync(cfgPath)) {
+        const j = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+        if (j.GatewayPort) cfg.port = j.GatewayPort;
+        if (j.DistroName) cfg.distro = j.DistroName;
+        break;
+      }
+    } catch { /* use defaults */ }
+  }
+
+  // 2. Read from tray settings (overrides setup config)
+  const settingsPath = path.join(appData, "OpenClawTray", "settings.json");
+  try {
+    if (fs.existsSync(settingsPath)) {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      if (settings.GatewayUrl) {
+        const m = settings.GatewayUrl.match(/:(\d+)\/?$/);
+        if (m) cfg.port = parseInt(m[1], 10);
+      }
+    }
+  } catch { /* use defaults */ }
+
+  // 3. (highest) CLI args: --port 12345 --distro MyDistro
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--port" && args[i + 1]) cfg.port = parseInt(args[i + 1], 10);
+    if (args[i] === "--distro" && args[i + 1]) cfg.distro = args[i + 1];
+  }
+
+  return cfg;
+}
+
 // ─── Helpers ───
 
-const GATEWAY_PORT = 18789;
-const DISTRO = "OpenClawGateway";
+const config = detectConfig();
+const GATEWAY_PORT = config.port;
+const DISTRO = config.distro;
 
 function log(msg) { console.log(`\x1b[36m[patch]\x1b[0m ${msg}`); }
 function ok(msg)  { console.log(`\x1b[32m  ✓\x1b[0m ${msg}`); }
@@ -178,9 +224,45 @@ function showStatus() {
   }
 }
 
+// ─── setup (orchestrated) ───
+
+function hasDistro() {
+  const r = spawnSync("wsl.exe", ["-l", "-q"], { encoding: "utf-8", windowsHide: true });
+  return (r.stdout || "").replace(/\0/g, "").includes(DISTRO);
+}
+
+function runSetup() {
+  log("=== OpenClaw Setup Patch Orchestrator ===\n");
+
+  // Phase 1: always fix port
+  log("Phase 1: Port check");
+  fixPort();
+  console.log();
+
+  // Phase 2: check WSL distro to decide cert strategy
+  if (hasDistro()) {
+    // Distro exists → we can sync certs now
+    log("Phase 2: WSL distro found — syncing certificates");
+    fixCerts();
+    console.log();
+    ok("All patches applied!");
+    log("Now re-run OpenClaw setup — it should succeed.\n");
+  } else {
+    // Distro doesn't exist yet → need setup to create it first
+    log("Phase 2: WSL distro not found yet\n");
+    ok("Port is ready.");
+    console.log();
+    log("Next steps:");
+    console.log("  1. Run OpenClaw setup now (it will create WSL but may fail at install-cli)");
+    console.log("  2. After that failure, run this command again:");
+    console.log(`     \x1b[1mopenclaw-patch setup\x1b[0m`);
+    console.log("  3. WSL distro will exist, certs will be synced, then re-run setup\n");
+  }
+}
+
 // ─── CLI ───
 
-const cmd = process.argv[2] || "all";
+const cmd = process.argv[2] || "setup";
 
 console.log("\n\x1b[1mopenclaw-patch v1.0.0\x1b[0m\n");
 
@@ -195,6 +277,10 @@ switch (cmd) {
 
   case "status":
     showStatus();
+    break;
+
+  case "setup":
+    runSetup();
     break;
 
   case "all":
@@ -213,10 +299,11 @@ switch (cmd) {
   default:
     console.log("Usage: openclaw-patch [command]\n");
     console.log("Commands:");
-    console.log("  all        Apply all patches (default)");
+    console.log("  setup      Guided setup patch (default)");
     console.log("  fix-port   Kill process holding port 18789");
     console.log("  fix-certs  Sync Windows CA certs to WSL");
     console.log("  status     Show current status");
+    console.log("  all        Apply all patches at once");
     break;
 }
 
