@@ -151,19 +151,20 @@ function fixCerts() {
   const certCount = (exp.out.match(/BEGIN CERTIFICATE/g) || []).length;
   log(`Exported ${certCount} certificates from Windows store`);
 
-  // Write to WSL via UNC path
-  const wslCertDir = `\\\\wsl$\\${DISTRO}\\usr\\local\\share\\ca-certificates`;
-  const wslCertFile = path.join(wslCertDir, "windows-ca-bundle.crt");
+  // Write cert bundle into WSL via wsl.exe stdin (avoids UNC EPERM issues)
+  const certPath = "/usr/local/share/ca-certificates/windows-ca-bundle.crt";
+  const writeResult = spawnSync("wsl.exe", [
+    "-d", DISTRO, "-u", "root", "--", "bash", "-c",
+    `mkdir -p /usr/local/share/ca-certificates && cat > ${certPath}`
+  ], {
+    input: exp.out, encoding: "utf-8", windowsHide: true, timeout: 30000,
+  });
 
-  try {
-    fs.mkdirSync(wslCertDir, { recursive: true });
-    fs.writeFileSync(wslCertFile, exp.out, "utf-8");
-    ok(`Wrote ${certCount} certs to WSL ca-certificates`);
-  } catch (e) {
-    fail(`Could not write to WSL filesystem: ${e.message}`);
-    warn("Make sure WSL is running: wsl -d OpenClawGateway -- echo ok");
+  if (writeResult.status !== 0) {
+    fail(`Could not write CA bundle to WSL: ${(writeResult.stderr || "").trim()}`);
     return false;
   }
+  ok(`Wrote ${certCount} certs to WSL ca-certificates`);
 
   // Run update-ca-certificates
   const up = wsl("update-ca-certificates 2>&1", "root");
@@ -203,11 +204,12 @@ function showStatus() {
     ok(`WSL distro: ${DISTRO} registered`);
 
     // CA bundle
-    const certPath = `\\\\wsl$\\${DISTRO}\\usr\\local\\share\\ca-certificates\\windows-ca-bundle.crt`;
-    if (fs.existsSync(certPath)) {
-      const content = fs.readFileSync(certPath, "utf-8");
-      const count = (content.match(/BEGIN CERTIFICATE/g) || []).length;
-      ok(`CA bundle: ${count} certs synced`);
+    const certCheck = spawnSync("wsl.exe", ["-d", DISTRO, "-u", "root", "--", "bash", "-c",
+      "grep -c 'BEGIN CERTIFICATE' /usr/local/share/ca-certificates/windows-ca-bundle.crt 2>/dev/null || echo 0"
+    ], { encoding: "utf-8", windowsHide: true, timeout: 10000 });
+    const certCount = parseInt((certCheck.stdout || "0").trim(), 10);
+    if (certCount > 0) {
+      ok(`CA bundle: ${certCount} certs synced`);
     } else {
       warn("CA bundle: not synced (run: openclaw-patch fix-certs)");
     }
@@ -224,6 +226,81 @@ function showStatus() {
   }
 }
 
+// ─── fix-wsl ───
+
+function getWslDistros() {
+  const r = spawnSync("wsl.exe", ["-l", "-q"], { encoding: "utf-8", windowsHide: true });
+  return (r.stdout || "").replace(/\0/g, "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+}
+
+function fixWsl() {
+  log(`Creating WSL distro '${DISTRO}' from local Ubuntu (bypasses --web-download TLS issue)...\n`);
+
+  const distros = getWslDistros();
+
+  // Already exists?
+  if (distros.includes(DISTRO)) {
+    ok(`WSL distro '${DISTRO}' already exists`);
+    return true;
+  }
+
+  // Find a source Ubuntu distro to export
+  const sourceDistro = distros.find(d => /^ubuntu/i.test(d));
+  if (!sourceDistro) {
+    fail("No local Ubuntu distro found to clone from");
+    warn("Install Ubuntu from Microsoft Store first: wsl --install Ubuntu-24.04");
+    return false;
+  }
+
+  log(`Found source distro: ${sourceDistro}`);
+
+  // Export source distro to temp tar
+  const appData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const tmpTar = path.join(appData, "OpenClawTray", "wsl-export.tar");
+  const installPath = path.join(appData, "OpenClawTray", "wsl", DISTRO);
+
+  try { fs.mkdirSync(path.dirname(tmpTar), { recursive: true }); } catch {}
+  try { fs.mkdirSync(path.dirname(installPath), { recursive: true }); } catch {}
+
+  log(`Exporting ${sourceDistro} → ${tmpTar} (this may take a minute)...`);
+  const exp = spawnSync("wsl.exe", ["--export", sourceDistro, tmpTar], {
+    encoding: "utf-8", windowsHide: true, timeout: 300000, stdio: "pipe",
+  });
+
+  if (exp.status !== 0) {
+    fail(`Export failed: ${(exp.stderr || "").trim()}`);
+    return false;
+  }
+  ok("Export complete");
+
+  // Import as OpenClawGateway
+  log(`Importing as '${DISTRO}' → ${installPath}...`);
+  const imp = spawnSync("wsl.exe", ["--import", DISTRO, installPath, tmpTar], {
+    encoding: "utf-8", windowsHide: true, timeout: 300000, stdio: "pipe",
+  });
+
+  if (imp.status !== 0) {
+    fail(`Import failed: ${(imp.stderr || "").trim()}`);
+    return false;
+  }
+  ok(`WSL distro '${DISTRO}' created`);
+
+  // Clean up temp tar
+  try { fs.unlinkSync(tmpTar); } catch {}
+
+  // Boot it once to make sure it's ready
+  const boot = spawnSync("wsl.exe", ["-d", DISTRO, "--", "echo", "ready"], {
+    encoding: "utf-8", windowsHide: true, timeout: 30000,
+  });
+  if (boot.status === 0) {
+    ok("Distro booted successfully");
+  } else {
+    warn("Distro created but first boot had issues — setup may still work");
+  }
+
+  return true;
+}
+
 // ─── setup (orchestrated) ───
 
 function hasDistro() {
@@ -234,30 +311,34 @@ function hasDistro() {
 function runSetup() {
   log("=== OpenClaw Setup Patch Orchestrator ===\n");
 
-  // Phase 1: always fix port
-  log("Phase 1: Port check");
-  fixPort();
+  // Phase 1: fix port
+  log("Phase 1/3: Port");
+  const p = fixPort();
   console.log();
 
-  // Phase 2: check WSL distro to decide cert strategy
+  // Phase 2: ensure WSL distro exists (bypass --web-download TLS)
+  log("Phase 2/3: WSL distro");
   if (hasDistro()) {
-    // Distro exists → we can sync certs now
-    log("Phase 2: WSL distro found — syncing certificates");
-    fixCerts();
-    console.log();
-    ok("All patches applied!");
-    log("Now re-run OpenClaw setup — it should succeed.\n");
+    ok(`WSL distro '${DISTRO}' already exists`);
   } else {
-    // Distro doesn't exist yet → need setup to create it first
-    log("Phase 2: WSL distro not found yet\n");
-    ok("Port is ready.");
-    console.log();
-    log("Next steps:");
-    console.log("  1. Run OpenClaw setup now (it will create WSL but may fail at install-cli)");
-    console.log("  2. After that failure, run this command again:");
-    console.log(`     \x1b[1mopenclaw-patch setup\x1b[0m`);
-    console.log("  3. WSL distro will exist, certs will be synced, then re-run setup\n");
+    fixWsl();
   }
+  console.log();
+
+  // Phase 3: sync CA certs
+  log("Phase 3/3: CA certificates");
+  if (hasDistro()) {
+    fixCerts();
+  } else {
+    fail("WSL distro still not available — cannot sync certs");
+    warn("Install Ubuntu manually: wsl --install Ubuntu-24.04");
+    warn("Then run: openclaw-patch setup");
+    return;
+  }
+  console.log();
+
+  ok("All patches applied!");
+  log("Now run OpenClaw setup — it should succeed.\n");
 }
 
 // ─── CLI ───
@@ -273,6 +354,10 @@ switch (cmd) {
 
   case "fix-certs":
     fixCerts();
+    break;
+
+  case "fix-wsl":
+    fixWsl();
     break;
 
   case "status":
@@ -299,8 +384,9 @@ switch (cmd) {
   default:
     console.log("Usage: openclaw-patch [command]\n");
     console.log("Commands:");
-    console.log("  setup      Guided setup patch (default)");
-    console.log("  fix-port   Kill process holding port 18789");
+    console.log("  setup      Full setup patch — port + wsl + certs (default)");
+    console.log("  fix-port   Kill process holding gateway port");
+    console.log("  fix-wsl    Create WSL distro from local Ubuntu (bypass --web-download)");
     console.log("  fix-certs  Sync Windows CA certs to WSL");
     console.log("  status     Show current status");
     console.log("  all        Apply all patches at once");
